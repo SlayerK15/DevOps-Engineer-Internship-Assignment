@@ -38,7 +38,7 @@ jobs:
           fail=0
           [ -n "${{ secrets.EC2_TARGET }}" ] || { echo "Missing secret: EC2_TARGET" >&2; fail=1; }
           [ -n "${{ secrets.EC2_SSH_KEY_PEM }}" ] || { echo "Missing secret: EC2_SSH_KEY_PEM" >&2; fail=1; }
-          [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ] || { echo "Missing secret: DOCKERHUB_TOKEN" >&2; fail=1; }
+          [ -n "${{ secrets.DOCKER_HUB_TOKEN }}" ] || { echo "Missing secret: DOCKERHUB_TOKEN" >&2; fail=1; }
           [ $fail -eq 0 ] || exit 1
 
       - name: Add SSH key
