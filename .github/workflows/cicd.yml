@@ -31,80 +31,68 @@ jobs:
     needs: build_and_push
     runs-on: ubuntu-latest
     steps:
-      - name: Add SSH key
-        run: |
-          install -m 600 -D /dev/stdin ~/.ssh/id_rsa <<'EOF'
-          ${{ secrets.EC2_SSH_KEY_PEM }}
-          EOF
-          printf "Host *\n  StrictHostKeyChecking no\n" >> ~/.ssh/config
+        -   name: Add SSH key
+            run: |
+                install -m 600 -D /dev/stdin ~/.ssh/id_rsa <<'EOF'
+                ${{ secrets.EC2_SSH_KEY_PEM }}
+                EOF
+                printf "Host *\n  StrictHostKeyChecking no\n" >> ~/.ssh/config
 
-      - name: Wait for Docker Hub tag propagation (45s)
-        run: sleep 45
+        -   name: Wait for Docker Hub tag propagation
+            run: sleep 45
 
-      - name: Deploy on EC2 (keep data, refresh containers)
-        run: |
-          ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} bash -s <<'REMOTE'
-          set -euo pipefail
+        -   name: Create docker-compose.yml locally (images only)
+            run: |
+                cat > docker-compose.yml <<'YAML'
+                version: "3.9"
+                services:
+                mongo:
+                    image: mongo:6
+                    restart: unless-stopped
+                    volumes:
+                    - mongo_data:/data/db
 
-          APP_DIR="/srv/app"
+                backend:
+                    image: slayerop15/backend:latest
+                    restart: unless-stopped
+                    environment:
+                    MONGO_URL: mongodb://mongo:27017/dd_db
+                    NODE_ENV: production
+                    depends_on:
+                    - mongo
 
-          # Ensure Docker & Compose exist
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "Docker not found; installing..."
-            sudo apt-get update -y
-            sudo apt-get install -y docker.io docker-compose-plugin
-            sudo systemctl enable --now docker
-          fi
+                frontend:
+                    image: slayerop15/frontend:latest
+                    restart: unless-stopped
+                    depends_on:
+                    - backend
+                    ports:
+                    - "80:80"
 
-          # Ensure app dir
-          sudo mkdir -p "$APP_DIR"
-          sudo chown -R "$USER":"$USER" "$APP_DIR"
-          cd "$APP_DIR"
+                volumes:
+                mongo_data:
+                YAML
 
-          # Write the compose file you specified (images only)
-          cat > docker-compose.yml <<'YAML'
-          services:
-            mongo:
-              image: mongo:6
-              restart: unless-stopped
-              volumes:
-                - mongo_data:/data/db
+        -   name: Copy compose to EC2
+            run: |
+                ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo mkdir -p /srv/app && sudo chown \$USER:\$USER /srv/app"
+                scp -i ~/.ssh/id_rsa docker-compose.yml ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/srv/app/docker-compose.yml
 
-            backend:
-              image: slayerop15/backend:latest
-              restart: unless-stopped
-              environment:
-                MONGO_URL: mongodb://mongo:27017/dd_db
-                NODE_ENV: production
-              depends_on:
-                - mongo
+        -   name: Deploy (install docker if needed → pull → down → up -d)
+            run: |
+                ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} '
+                set -euo pipefail
 
-            frontend:
-              image: slayerop15/frontend:latest
-              restart: unless-stopped
-              depends_on:
-                - backend
-              ports:
-                - "80:80"
+                # Install Docker & Compose if missing
+                if ! command -v docker >/dev/null 2>&1; then
+                    sudo apt-get update -y
+                    sudo apt-get install -y docker.io docker-compose-plugin
+                    sudo systemctl enable --now docker
+                fi
 
-          volumes:
-            mongo_data:
-          YAML
-
-          echo "Pulling latest images…"
-          sudo docker compose pull
-
-          echo "Stopping containers (keeping volumes)…"
-          # IMPORTANT: no -v here, so mongo_data persists.
-          sudo docker compose down --remove-orphans
-
-          echo "Starting containers with fresh images…"
-          sudo docker compose up -d
-
-          echo "Pruning unused images (optional)…"
-          sudo docker image prune -f || true
-
-          echo "Current status:"
-          sudo docker ps
-          
-          REMOTE
+                cd /srv/app
+                sudo docker compose pull
+                sudo docker compose down --remove-orphans   # no -v -> keeps mongo_data
+                sudo docker compose up -d
+                sudo docker ps
+                '
