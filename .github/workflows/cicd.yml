@@ -1,4 +1,4 @@
-name: CI/CD (Build → Push → Compose down/up)
+name: CI/CD (Build → Push → Deploy)
 
 on:
   push:
@@ -14,8 +14,10 @@ jobs:
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
+          registry: docker.io
+          ecr: false
           username: slayerop15
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build & push frontend
         run: |
@@ -31,68 +33,85 @@ jobs:
     needs: build_and_push
     runs-on: ubuntu-latest
     steps:
-        -   name: Add SSH key
-            run: |
-                install -m 600 -D /dev/stdin ~/.ssh/id_rsa <<'EOF'
-                ${{ secrets.EC2_SSH_KEY_PEM }}
-                EOF
-                printf "Host *\n  StrictHostKeyChecking no\n" >> ~/.ssh/config
+      - name: Validate required secrets
+        run: |
+          fail=0
+          [ -n "${{ secrets.EC2_TARGET }}" ] || { echo "Missing secret: EC2_TARGET" >&2; fail=1; }
+          [ -n "${{ secrets.EC2_SSH_KEY_PEM }}" ] || { echo "Missing secret: EC2_SSH_KEY_PEM" >&2; fail=1; }
+          [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ] || { echo "Missing secret: DOCKERHUB_TOKEN" >&2; fail=1; }
+          [ $fail -eq 0 ] || exit 1
 
-        -   name: Wait for Docker Hub tag propagation
-            run: sleep 45
+      - name: Add SSH key
+        run: |
+          install -m 600 -D /dev/stdin ~/.ssh/id_rsa <<'EOF'
+          ${{ secrets.EC2_SSH_KEY_PEM }}
+          EOF
+          printf "Host *\n  StrictHostKeyChecking no\n" >> ~/.ssh/config
 
-        -   name: Create docker-compose.yml locally (images only)
-            run: |
-                cat > docker-compose.yml <<'YAML'
-                version: "3.9"
-                services:
-                mongo:
-                    image: mongo:6
-                    restart: unless-stopped
-                    volumes:
-                    - mongo_data:/data/db
+      - name: Wait for Docker Hub tag propagation
+        run: sleep 45
 
-                backend:
-                    image: slayerop15/backend:latest
-                    restart: unless-stopped
-                    environment:
-                    MONGO_URL: mongodb://mongo:27017/dd_db
-                    NODE_ENV: production
-                    depends_on:
-                    - mongo
+      - name: Create docker-compose.yml locally (images only)
+        run: |
+          cat > docker-compose.yml <<'YAML'
+          services:
+            mongo:
+              image: mongo:6
+              restart: unless-stopped
+              volumes:
+                - mongo_data:/data/db
 
-                frontend:
-                    image: slayerop15/frontend:latest
-                    restart: unless-stopped
-                    depends_on:
-                    - backend
-                    ports:
-                    - "80:80"
+            backend:
+              image: slayerop15/backend:latest
+              restart: unless-stopped
+              environment:
+                MONGO_URL: mongodb://mongo:27017/dd_db
+                NODE_ENV: production
+              depends_on:
+                - mongo
 
-                volumes:
-                mongo_data:
-                YAML
+            frontend:
+              image: slayerop15/frontend:latest
+              restart: unless-stopped
+              depends_on:
+                - backend
+              ports:
+                - "80:80"
 
-        -   name: Copy compose to EC2
-            run: |
-                ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "sudo mkdir -p /srv/app && sudo chown \$USER:\$USER /srv/app"
-                scp -i ~/.ssh/id_rsa docker-compose.yml ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/srv/app/docker-compose.yml
+          volumes:
+            mongo_data:
+          YAML
 
-        -   name: Deploy (install docker if needed → pull → down → up -d)
-            run: |
-                ssh -i ~/.ssh/id_rsa ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} '
-                set -euo pipefail
+      - name: Ensure target dir & copy compose to EC2
+        run: |
+          ssh -i ~/.ssh/id_rsa "${{ secrets.EC2_TARGET }}" "sudo mkdir -p /srv/app && sudo chown \$USER:\$USER /srv/app"
+          scp -i ~/.ssh/id_rsa docker-compose.yml "${{ secrets.EC2_TARGET }}":/srv/app/docker-compose.yml
 
-                # Install Docker & Compose if missing
-                if ! command -v docker >/dev/null 2>&1; then
-                    sudo apt-get update -y
-                    sudo apt-get install -y docker.io docker-compose-plugin
-                    sudo systemctl enable --now docker
-                fi
+      - name: Deploy on EC2 (pull → down → up -d, keep volumes)
+        run: |
+          ssh -i ~/.ssh/id_rsa "${{ secrets.EC2_TARGET }}" '
+            set -euo pipefail
 
-                cd /srv/app
-                sudo docker compose pull
-                sudo docker compose down --remove-orphans   # no -v -> keeps mongo_data
-                sudo docker compose up -d
-                sudo docker ps
-                '
+            # Install Docker & Compose if missing
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io docker-compose-plugin
+              sudo systemctl enable --now docker
+            fi
+
+            cd /srv/app
+            echo "Pulling latest images…"
+            sudo docker compose pull
+
+            echo "Stopping containers (keeping volumes)…"
+            sudo docker compose down --remove-orphans   # no -v: keeps mongo_data
+
+            echo "Starting containers with fresh images…"
+            sudo docker compose up -d
+
+            echo "Pruning unused images (optional)…"
+            sudo docker image prune -f || true
+
+            echo "Current status:"
+            sudo docker ps
+          '
