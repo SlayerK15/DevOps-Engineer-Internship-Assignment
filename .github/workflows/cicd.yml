@@ -17,7 +17,7 @@ jobs:
           registry: docker.io
           ecr: false
           username: slayerop15
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
       - name: Build & push frontend
         run: |
